@@ -1,0 +1,527 @@
+================================================================================
+  ORCA OS — КАРТА ПРОЕКТА
+  Что где лежит и что делает. Обновлять при изменении состава файлов.
+================================================================================
+
+ЧТО ЭТО ВООБЩЕ
+--------------
+Операционная система для наручных часов на STM32H743IIT6 (Cortex-M7, 480 МГц)
+плюс всё, что вокруг: Wi-Fi мост на ESP32-S3, Android-приложение, PC-тулзы,
+SDK для сторонних модулей. Главная фича системы — загрузка приложений
+(.orca, relocatable ELF32) с microSD в рантайме, без пересборки прошивки.
+
+
+ВЕРХНИЙ УРОВЕНЬ
+---------------
+  orca/
+  |
+  +-- firmware/       прошивка STM32H743 (ядро ОС). CMake + arm-none-eabi-gcc
+  +-- esp32/          прошивка ESP32-S3 (мост UART<->Wi-Fi). ESP-IDF
+  +-- app/            Android-приложение. Gradle + Kotlin + Compose
+  +-- tools/          PC-инструменты и SDK для модулей
+  +-- sdcard_root/    образ содержимого microSD часов
+  +-- docs/           проектная документация (пишет человек)
+  |
+  +-- promt.txt                    bootstrap-инструкция для ассистента
+  +-- info.txt                     этот файл
+  +-- errors.txt                   подтверждённые ошибки
+  +-- warnings.txt                 некритичные проблемы
+  +-- i-think-it-can-be-error.txt  непроверенные гипотезы
+  +-- todo.txt                     планы
+  |
+  +-- .aider.chat.history.md   мусор от предыдущей попытки через aider, не нужен
+  +-- .aider.input.history     то же
+  +-- .claude/settings.local.json  разрешённые команды для ассистента
+
+Репозиторий git НЕ инициализирован.
+Объёмы: app/ 87M (в основном .gradle кеш и build), firmware/ 624M (в основном
+firmware/build/_deps — скачанные HAL/CMSIS/FreeRTOS/FatFs), esp32/ 144K,
+tools/ 104K, docs/ 32K, sdcard_root/ 8K.
+
+
+================================================================================
+  firmware/  —  ЯДРО ОС НА STM32H743
+================================================================================
+
+Собирается так:
+    cd firmware
+    cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi.cmake \
+          -DCMAKE_BUILD_TYPE=Debug
+    cmake --build build -j
+Прошивка: cmake --build build --target flash-dfu  (плата в DFU, 0483:df11)
+
+  firmware/
+  +-- CMakeLists.txt      сборка. Тянет зависимости через FetchContent:
+  |                       stm32h7xx_hal_driver v1.11.2, cmsis_device_h7 v1.10.4,
+  |                       CMSIS_5 5.9.0, FreeRTOS-Kernel V11.1.0, FatFs ff15.
+  |                       Копирует Core/Inc/ffconf.h внутрь дерева FatFs
+  |                       (иначе ff.h подхватит свой дефолтный конфиг).
+  |                       Собирает Core/Src/*.c + OrcaKernel/*/*.c глобом.
+  +-- cmake/
+  |   +-- arm-none-eabi.cmake   тулчейн-файл: -mcpu=cortex-m7, -mfpu=fpv5-d16,
+  |                             -mfloat-abi=hard, nano.specs, флаги линковки.
+  +-- Linker/
+  |   +-- STM32H743IITx_FLASH.ld  карта памяти: FLASH 2M @0x08000000,
+  |                               DTCMRAM 128K @0x20000000, RAM_D1 512K
+  |                               @0x24000000, RAM_D2 288K @0x30000000,
+  |                               RAM_D3 64K @0x38000000.
+  +-- Drivers/
+  |   +-- startup_stm32h743xx.s   вектор прерываний + Reset_Handler (от ST)
+  |   +-- system_stm32h7xx.c      SystemInit (от ST)
+  +-- Middlewares/
+  |   +-- README.md    объясняет, что вендорный код сюда НЕ коммитится.
+  |                    Сейчас папка пустая — всё тянет FetchContent.
+  |                    README описывает старую ручную раскладку; неактуален.
+  +-- build/           артефакты сборки: orca_kernel.elf/.bin/.hex/.map + _deps
+  |
+  +-- Core/            платформенный слой: HAL, BSP, прерывания
+  +-- OrcaKernel/      собственно ядро ОС
+
+
+firmware/Core/Inc/  —  заголовки платформы
+  board.h              прототипы board_init / board_*_ready
+  main.h               общие define'ы платы, пины LED
+  FreeRTOSConfig.h     конфиг FreeRTOS: heap_4 128 KB, configUSE_NEWLIB_REENTRANT,
+                       configCHECK_FOR_STACK_OVERFLOW=2, хуки уходят в orca_panic
+  ffconf.h             конфиг FatFs: FF_USE_LFN=1, FF_VOLUMES>=2 (SD + QSPI),
+                       FF_MAX_SS=512
+  orca_panic.h         API паники: orca_panic(reason, file, line)
+  stm32h7xx_hal_conf.h какие модули HAL включены
+  stm32h7xx_it.h       прототипы обработчиков прерываний
+
+firmware/Core/Src/  —  платформа и BSP
+  main.c               точка входа. HAL_Init -> board_init -> создаёт две задачи
+                       (heartbeat 128 слов, system_init 512 слов) ->
+                       vTaskStartScheduler. system_init_task поднимает по
+                       порядку: UART, SDRAM, QSPI, SDMMC, appmgr, fbstream,
+                       shell, link service (3072 слова), fbtest (512 слов).
+  board.c              тактирование 480 МГц (PLL), HCLK 240 МГц, GPIO, MPU
+                       (5 регионов: SDRAM exec / FB write-through / GUI heap /
+                       QSPI RO-exec / RAM_D2 non-cacheable под DMA), кеши.
+  bsp_uart.c           USART1 на 921600 через CH340: консоль + транспорт OLP.
+                       Кольцевые буферы, bsp_modem_uart_* пока заглушки.
+  bsp_sdram.c          FMC SDRAM 32 МБ @0xC0000000, инициализация + memtest
+                       (бегущая единица по адресным линиям, только в Debug).
+  bsp_sdmmc.c          SDMMC1 4-бит microSD + diskio-слой для FatFs.
+                       Статический выровненный буфер s_align_buf под DMA.
+                       get_fattime() возвращает захардкоженное 2025-01-01.
+  bsp_qspi.c           QSPI 16 МБ @0x90000000, перевод в memory-mapped режим.
+  retarget.c           printf -> UART (_write), _sbrk для newlib.
+  orca_panic.c         паника: гасит прерывания, печатает причину, мигает LED.
+  stm32h7xx_it.c       обработчики: HardFault/MemManage/BusFault -> orca_panic,
+                       SysTick -> FreeRTOS, прерывания UART/SDMMC.
+
+firmware/OrcaKernel/  —  ЯДРО ORCA
+Всё, что не привязано к конкретной ножке МК. Разбито на подсистемы; каждая
+подпапка добавлена в include-пути, поэтому #include "orca_api.h" работает
+из любого файла ядра.
+
+  api/
+    orca_api.h          КОНТРАКТ С МОДУЛЯМИ. Структура orca_api_t — таблица
+                        указателей на функции, сгруппированных по подсистемам:
+                        log / task / storage / gpio / uart / spi / i2c / gui /
+                        system / ipc / console. Здесь же типы точек входа
+                        orca_app_main / orca_app_stop / orca_cmd_main и версия
+                        ABI. При изменении — синхронно править docs/module_api.md.
+    orca_api_table.c    РЕАЛИЗАЦИЯ таблицы поверх HAL и FreeRTOS (~745 строк).
+                        Ручки наружу отдаются не указателями, а тегами:
+                        DIR_HANDLE_BASE 0x4D170000, UART_HANDLE_BASE 0x4A700000 —
+                        чтобы модуль не мог подсунуть свой указатель.
+                        Реально работают log, task, storage, gpio, uart, console,
+                        часть system. spi/i2c/ipc и большая часть gui — заглушки.
+
+  loader/
+    orca_elf.h          минимальные структуры ELF32: Ehdr/Shdr/Sym/Rel, коды
+                        релокаций R_ARM_ABS32/REL32/THM_CALL/THM_JUMP24/
+                        PREL31/TARGET1, макросы ELF32_ST_TYPE и т.п.
+    orca_loader.h       API загрузчика + перечисление кодов ошибок
+                        (ORCA_LOAD_ERR_BAD_ELF, _UNSUPPORTED_RELOC,
+                        _UNDEFINED_SYMBOL, _NO_MEMORY, _NO_ENTRY,
+                        _API_VERSION, _BUSY).
+    orca_loader.c       ГЛАВНЫЙ ФАЙЛ ЗАГРУЗЧИКА (~530 строк). Читает .orca
+                        (ET_REL, результат `ld -r`) с VFS, раскладывает секции
+                        в арену SDRAM, применяет релокации, резолвит внешние
+                        символы по встроенной таблице (мини-libc: memcpy,
+                        memset, strlen, strcmp, snprintf, atoi...), ищет точки
+                        входа. Разбор сериализован мьютексом s_load_lock
+                        (таймаут 2 с -> ERR_BUSY), буферы статические:
+                        sections[32], symtab_buf[256], strtab_buf[2048].
+                        Проверок много и они правильные: sh_addralign должен
+                        быть степенью двойки и <=4096, суммарный размер
+                        считается без переполнения, r_offset проверяется на
+                        выход за секцию, st_name — на выход за strtab.
+                        patch_thumb_branch() умеет THM_CALL/THM_JUMP24, то есть
+                        -mlong-calls больше не требуется (а в SDK всё ещё
+                        написано, что требуется — см. errors.txt ERR-002).
+    orca_loader_cache.c синхронизация кешей Cortex-M7 после записи кода в
+                        SDRAM: SCB_CleanDCache_by_Addr + SCB_InvalidateICache.
+                        Без этого модуль исполняется как мусор.
+
+  services/
+    orca_arena.h/.c     аллокатор арены SDRAM под код/данные/стеки модулей.
+                        first-fit по free-list, выравнивание, split блоков.
+                        Блокировка через taskENTER_CRITICAL (мьютекс нельзя:
+                        init вызывается до старта планировщика).
+                        orca_arena_free() молча игнорирует чужой указатель.
+    orca_appmgr.h/.c    менеджер приложений: старт/стоп/список, состояния
+                        LOADED/RUNNING/STOPPING/STOPPED. claim_teardown()
+                        делает атомарный переход RUNNING->STOPPING в
+                        критической секции, так что двойной stop безопасен.
+                        Стек задачи модуля берётся из манифеста без нижнего
+                        порога (см. warnings.txt).
+    orca_link_service.h/.c  диспетчер OLP на стороне часов (~263 строки).
+                        Отдельная задача читает UART, кормит парсер, разбирает
+                        типы кадров, отвечает HELLO/PONG, принимает FB_REQ,
+                        TOUCH, BUTTON, SHELL. Ответ shell'а режется на кадры
+                        по ORCA_LINK_SHELL_TEXT_MAX с флагом more.
+                        Есть таймаут кадра ORCA_LINK_FRAME_TIMEOUT_MS — чтобы
+                        байт 0xAA внутри UTF-8 текста не подвесил парсер.
+
+  link/
+    orca_link.h         ОПРЕДЕЛЕНИЕ ПРОТОКОЛА OLP — единственный источник
+                        истины. Магия 0xAA 0x55, заголовок 8 байт, payload
+                        до 1024, CRC16 2 байта. Типы кадров:
+                          PING 0x01  PONG 0x02  HELLO 0x03  LOG 0x10
+                          FB_INFO 0x20  FB_CHUNK 0x21  FB_END 0x22  FB_REQ 0x23
+                          TOUCH 0x30  BUTTON 0x31
+                          SHELL 0x40  SHELL_RESP 0x41
+                          NET_STATUS 0x50  NET_CONFIG 0x51  ERROR 0xF0
+                        Плюс packed-структуры payload'ов и pixfmt'ы
+                        (RGB565=1, RGB888=2, GRAY8=3, RLE_RGB565=4).
+    orca_link.c         кодер/декодер: CRC16-CCITT-FALSE, orca_link_encode(),
+                        побайтовый конечный автомат orca_link_rx_byte().
+                        ЭТОТ ЖЕ ФАЙЛ компилируется в прошивку ESP32 напрямую
+                        (см. esp32/components/orca_link/CMakeLists.txt) — копии
+                        протокола нет, и это правильно.
+    orca_fbstream.h/.c  трансляция экрана. Берёт кадр из framebuffer, при
+                        необходимости прореживает (scale 1/2/4) и конвертирует
+                        RGB565 -> RGB565/RGB888/GRAY8, режет на FB_CHUNK так,
+                        чтобы пиксель не разрывался между кадрами, ограничивает
+                        частоту max_fps. Работает best effort: если в TX-буфере
+                        мало места — кадр дропается целиком, потому что рвать
+                        картинку хуже, чем пропустить.
+
+  shell/
+    orca_shell.h/.c     текстовый shell: разбор строки, встроенные команды
+                        (help, ps, free, ls, cat, run, kill, reboot, link, fb).
+                        Вывод копится в буфер SHELL_OUT_MAX, а не печатается
+                        напрямую — потому что тот же вывод уходит по OLP.
+    orca_cmdfs.h/.c     команды как модули: если команды нет во встроенных,
+                        ищется /bin/<name>.orca, грузится и вызывается
+                        orca_cmd_main(argc, argv).
+
+  fs/
+    orca_fileio.h/.c    тонкая обёртка над FatFs: open/read/write/seek/close,
+                        opendir/readdir, stat, mkdir, unlink. Именно её
+                        оборачивает группа storage в orca_api_table.c.
+
+  gui/
+    orca_input.h/.c     состояние тача и кнопок. Заполняется извне (OLP TOUCH/
+                        BUTTON от телефона или реальный тачскрин), читается
+                        модулями через api->gui.
+    orca_fbtest.h/.c    тестовая задача отрисовки: цветные полосы, счётчик
+                        кадров. Нужна, чтобы проверить fbstream, пока
+                        настоящего GUI-движка нет.
+
+  hal/
+    orca_memmap.h       КАРТА ПАМЯТИ ЯДРА, важный файл:
+                        FLASH 2M @0x08000000, DTCM 128K @0x20000000,
+                        AXI SRAM 512K @0x24000000, QSPI 16M @0x90000000,
+                        SDRAM 32M @0xC0000000.
+                        Разметка SDRAM: FB_POOL 4M, GUI_HEAP 2M,
+                        APP_ARENA = остаток (26M).
+                        Лимиты модуля: MAX_IMAGE_SIZE 512K,
+                        DEFAULT_STACK 16K, MAX_INSTANCES 16.
+
+
+================================================================================
+  esp32/  —  МОСТ UART <-> WI-FI НА ESP32-S3
+================================================================================
+
+Собирается ESP-IDF:  cd esp32 && idf.py set-target esp32s3 && idf.py build
+
+Зачем нужен: часы разговаривают только по UART. ESP прозрачно пересылает те
+же самые кадры OLP в TCP и в WebSocket, ничего в них не меняя. Поэтому и
+Android-приложение, и tools/fbstream, и веб-морда используют один протокол.
+
+  esp32/
+  +-- CMakeLists.txt      корневой, project(orca_esp_link)
+  +-- partitions.csv      nvs 24K, phy_init 4K, factory 3M
+  +-- sdkconfig.defaults  ключевые настройки: HTTPD_WS_SUPPORT=y (иначе /ws не
+  |                       поднимется), LWIP_MAX_SOCKETS=16 (httpd 7 + мост 5 +
+  |                       listen), TCP буферы 32K, FREERTOS_HZ=1000,
+  |                       Wi-Fi без power save, task WDT 10 с.
+  |
+  +-- components/orca_link/
+  |   +-- CMakeLists.txt  ХИТРОСТЬ: в SRCS указан не локальный файл, а
+  |   |                   ../../../firmware/OrcaKernel/link/orca_link.c —
+  |   |                   протокол берётся прямо из прошивки часов, чтобы две
+  |   |                   копии не разъехались.
+  |   +-- include/orca_demux.h
+  |   +-- orca_demux.c    разделение потока UART на кадры OLP и обычный текст
+  |                       (прошивка часов печатает логи обычным printf мимо
+  |                       протокола). Отличие от firmware/orca_link.c: при
+  |                       битой версии/длине demux выплёвывает накопленные
+  |                       байты как текст (spill_buffer_as_text), а не молча
+  |                       ресинкается. См. warnings.txt WARN-010.
+  |
+  +-- main/
+      +-- CMakeLists.txt      регистрация компонента. EMBED_TXTFILES вшивает
+      |                       web/index.html, web/app.css, web/app.js.
+      |                       app.js НЕ СУЩЕСТВУЕТ -> сборка падает (ERR-001).
+      +-- Kconfig.projbuild   меню "Orca ESP Link": UART порт (по умолчанию 1,
+      |                       т.к. UART0 занят логом IDF), TX 17, RX 18,
+      |                       baud 921600, TCP порт 3333, пароль AP "orcalink".
+      +-- main.c              app_main: NVS -> cfg -> hub -> uart -> wifi ->
+      |                       tcp -> web. Порядок важен: hub нужен всем.
+      +-- orca_hub.h/.c       БРОКЕР публикация/подписка (~356 строк). Один
+      |                       поток из UART надо раздать нескольким
+      |                       потребителям (TCP-клиенты, WebSocket-клиенты).
+      |                       Каждый подписчик получает свой StreamBuffer;
+      |                       если подписчик тормозит — его данные дропаются,
+      |                       остальных это не тормозит.
+      +-- orca_uart.h/.c      драйвер UART к часам: RX буфер 8192, TX 4096,
+      |                       задача чтения с приоритетом 12, смена скорости
+      |                       в рантайме (валидация 9600..3000000).
+      +-- orca_tcp.h/.c       TCP-сервер :3333 (~205 строк). Задача на клиента,
+      |                       двунаправленная перекачка hub <-> сокет.
+      +-- orca_web.h/.c       HTTP + WebSocket + REST (~441 строка). Отдаёт
+      |                       вшитые index.html/app.css/app.js, поднимает /ws
+      |                       с задачей ws_tx_task на каждого клиента,
+      |                       REST: /api/status, /api/wifi (POST),
+      |                       /api/uart (POST), /api/reboot (POST).
+      |                       max_open_sockets=7.
+      +-- orca_wifi.h/.c      AP+STA одновременно (~272 строки). AP поднят
+      |                       всегда — иначе, ошибившись паролем, до устройства
+      |                       было бы уже не достучаться. 5 быстрых повторов
+      |                       подключения, дальше отдельная задача медленного
+      |                       ретрая.
+      +-- orca_cfg.h/.c       настройки в NVS: ssid, пароль, baud, порт.
+      +-- web/
+          +-- index.html      веб-морда: 4 вкладки (Экран/Консоль/Устройство/
+          |                   Настройки), canvas 480x320 для кадров, форма
+          |                   shell, формы Wi-Fi и UART. В конце подключает
+          |                   <script src="/app.js">.
+          +-- app.css         тёмная тема, ~5.4 КБ.
+          +-- (app.js)        ОТСУТСТВУЕТ. Должен: открыть WebSocket /ws,
+                              парсить OLP в браузере, рисовать кадры на canvas,
+                              слать TOUCH/BUTTON/SHELL/FB_REQ, дёргать REST.
+
+
+================================================================================
+  app/  —  ANDROID-ПРИЛОЖЕНИЕ
+================================================================================
+
+Собирается:  cd app && ./gradlew :app:assembleDebug
+Тесты:       ./gradlew :app:testDebugUnitTest
+Kotlin 2.2.10, AGP 9.2.1, Gradle 9.4.1, Compose BOM 2026.02.01,
+minSdk 26, targetSdk/compileSdk 37, applicationId org.orca.project.
+
+  app/
+  +-- settings.gradle.kts     rootProject "Orca", include(":app")
+  +-- build.gradle.kts        корневой, плагины без apply
+  +-- gradle.properties       jvmargs 2G, configuration-cache=on
+  +-- gradle/libs.versions.toml  version catalog: все версии зависимостей
+  +-- gradle/wrapper/...      Gradle 9.4.1
+  +-- local.properties        путь к Android SDK (машинозависимый)
+  +-- gradlew / gradlew.bat   врапперы
+  +-- .idea/                  настройки Android Studio
+  |
+  +-- app/build.gradle.kts    модуль приложения. Compose, DataStore,
+  |                           lifecycle-service. Ketchum SDK подключается как
+  |                           fileTree("libs") — jar'а в maven нет, кладётся
+  |                           руками, поэтому вся работа с ним через рефлексию.
+  +-- app/proguard-rules.pro  пустой
+  +-- app/src/main/AndroidManifest.xml
+  |       разрешения INTERNET, ACCESS_NETWORK_STATE, POST_NOTIFICATIONS,
+  |       FOREGROUND_SERVICE + FOREGROUND_SERVICE_CONNECTED_DEVICE,
+  |       регистрация MainActivity и OrcaLinkService
+  |
+  +-- app/src/main/java/org/orca/project/
+  |   +-- MainActivity.kt          единственная Activity: enableEdgeToEdge,
+  |   |                            setContent { OrcaTheme { OrcaApp() } }
+  |   |
+  |   +-- link/                    РЕАЛИЗАЦИЯ OLP НА KOTLIN
+  |   |   +-- Olp.kt               константы протокола, crc16, encode,
+  |   |   |                        хелперы little-endian и C-строк,
+  |   |   |                        SCREEN_W=480, SCREEN_H=320
+  |   |   +-- OlpParser.kt         потоковый парсер, зеркало orca_link_rx_byte.
+  |   |   |                        Байты вне кадров копятся и отдаются
+  |   |   |                        takeText() — это логи printf с часов.
+  |   |   |                        Считает framesOk / crcErrors / resyncs.
+  |   |   +-- Payloads.kt          структуры payload'ов и их разбор/сборка.
+  |   |   |                        Размеры: Hello 48, LogRecord 20, FbInfo 16,
+  |   |   |                        FbChunk 8, ShellResponse 8, NetStatus 53,
+  |   |   |                        NetConfig 98, DeviceError 4.
+  |   |   +-- FrameAssembler.kt    склейка кадра экрана из FB_INFO + N*FB_CHUNK
+  |   |   |                        + FB_END. Буфер выделяется заново на каждый
+  |   |   |                        FB_INFO, поэтому потерянные чанки дают нули,
+  |   |   |                        а не мусор прошлого кадра. Конвертация в
+  |   |   |                        ARGB_8888, поддержаны RGB565/RGB888/GRAY8/
+  |   |   |                        RLE_RGB565. Лимит кадра 4 МБ.
+  |   |   +-- Transport.kt         интерфейс транспорта + TcpTransport
+  |   |   |                        (tcpNoDelay, keepAlive, soTimeout 1 с).
+  |   |   |                        USB/BLE транспортов пока нет.
+  |   |   +-- OrcaClient.kt        клиент целиком: корутина чтения + корутина
+  |   |                            записи через Channel, переподключение с
+  |   |                            экспоненциальным backoff 500 мс -> 10 с,
+  |   |                            склейка многокадровых ответов shell,
+  |   |                            подсчёт fps. Наружу — SharedFlow<OrcaEvent>
+  |   |                            и StateFlow со статусом и статистикой.
+  |   |
+  |   +-- data/
+  |   |   +-- OrcaRepository.kt    синглтон-состояние приложения: держит
+  |   |   |                        OrcaClient, буфер консоли, последний HELLO,
+  |   |   |                        NET_STATUS, ScreenBuffer, статус глифов.
+  |   |   +-- ScreenBuffer.kt      Bitmap + счётчик version. Пиксели пишутся в
+  |   |   |                        тот же Bitmap (не аллоцируется новый на
+  |   |   |                        кадр), а Compose узнаёт об обновлении
+  |   |   |                        по чтению version в draw-лямбде.
+  |   |   +-- SettingsRepository.kt DataStore Preferences: host, port,
+  |   |                            autoConnect, streamEnabled, pixfmt, scale,
+  |   |                            maxFps, настройки глифов.
+  |   |
+  |   +-- service/
+  |   |   +-- OrcaLinkService.kt   foreground-сервис. Связь живёт здесь, а не
+  |   |                            в Activity: иначе соединение рвалось бы при
+  |   |                            сворачивании приложения. Уведомление
+  |   |                            показывает состояние линка.
+  |   |
+  |   +-- glyph/                   ИНДИКАЦИЯ НА NOTHING PHONE (2)
+  |   |   +-- GlyphZone.kt         5 логических зон (A..E) с маппингом и на
+  |   |   |                        каналы Ketchum SDK, и на файлы sysfs
+  |   |   |                        драйвера aw210xx. Плюс GlyphTrigger —
+  |   |   |                        какое событие часов зажигает какую зону,
+  |   |   |                        и GlyphCommand (Pulse/On/Off/Progress/AllOff).
+  |   |   +-- GlyphBackend.kt      интерфейс бэкенда + диагностика
+  |   |   +-- KetchumGlyphBackend.kt  официальный Glyph Developer Kit целиком
+  |   |   |                        через рефлексию — jar опционален, прямые
+  |   |   |                        импорты сломали бы сборку без него.
+  |   |   +-- RootGlyphBackend.kt  запись в /sys/class/leds/aw210xx_led через
+  |   |   |                        su. Имена узлов не захардкожены: сканирует
+  |   |   |                        каталог, при незнакомых именах берёт всё,
+  |   |   |                        что оканчивается на _br.
+  |   |   +-- GlyphController.kt   выбор бэкенда, очередь команд, привязка
+  |   |                            триггеров к событиям OrcaClient.
+  |   |
+  |   +-- root/
+  |   |   +-- RootShell.kt         долгоживущий процесс su, exec/write,
+  |   |                            проверка наличия su.
+  |   |
+  |   +-- ui/                      ЭКРАНЫ (Jetpack Compose)
+  |       +-- OrcaApp.kt           каркас: TopAppBar с индикатором связи,
+  |       |                        NavigationBar с 4 вкладками, запрос
+  |       |                        POST_NOTIFICATIONS.
+  |       +-- OrcaViewModel.kt     ViewModel: пробрасывает потоки репозитория,
+  |       |                        история команд (последние 50), применение
+  |       |                        настроек.
+  |       +-- ScreenScreen.kt      зеркало экрана. aspectRatio жёстко 480/320,
+  |       |                        чтобы координата касания совпадала с
+  |       |                        устройством без поправок на letterbox.
+  |       |                        MOVE троттлится до 25 мс — палец даёт ~120
+  |       |                        событий в секунду, очередь бы забилась.
+  |       +-- ConsoleScreen.kt     лог + ввод команд, быстрые кнопки
+  |       |                        (help/ps/link/fb on/fb off/reboot),
+  |       |                        история, автопрокрутка.
+  |       +-- DeviceScreen.kt      HELLO, статистика линка, сеть ESP32 с
+  |       |                        формой NET_CONFIG, панель глифов.
+  |       +-- SettingsScreen.kt    endpoint, автоподключение, параметры
+  |       |                        трансляции, настройки глифов.
+  |       +-- Common.kt            SectionCard / InfoRow / OptionChips
+  |       +-- theme/Color.kt, Theme.kt, Type.kt
+  |                                тема по шаблону Android Studio (Material3,
+  |                                dynamic color). Не адаптирована под проект.
+  |
+  +-- app/src/main/res/            иконки, strings.xml (одна строка "Orca"),
+  |                                themes.xml, backup_rules.xml,
+  |                                data_extraction_rules.xml (оба — шаблонные
+  |                                заготовки с закомментированным содержимым),
+  |                                drawable/ic_notification.xml
+  +-- app/src/main/keepRules/rules.keep   шаблонный, пустой по смыслу
+  |
+  +-- app/src/test/java/org/orca/project/
+  |   +-- ExampleUnitTest.kt              шаблон (2+2=4), можно удалять
+  |   +-- link/OlpTest.kt                 ХОРОШИЕ тесты протокола: эталонный
+  |   |                                   вектор CRC "123456789"->0x29B1,
+  |   |                                   раскладка кадра, round-trip, разрыв
+  |   |                                   потока на куски по 7 байт, отделение
+  |   |                                   текста от кадров, двойной 0xAA,
+  |   |                                   битый CRC, чужая версия, клампы.
+  |   +-- link/FrameAssemblerTest.kt      сборка кадра, неполный кадр,
+  |                                       чанк без FB_INFO, слишком большой
+  |                                       кадр, все pixfmt'ы включая RLE.
+  +-- app/src/androidTest/.../ExampleInstrumentedTest.kt   шаблон
+
+
+================================================================================
+  tools/  —  PC-ИНСТРУМЕНТЫ
+================================================================================
+
+  tools/fbstream/
+    orca_view.py        PC-клиент на Python, ~836 строк, без зависимостей
+                        (tkinter из стандартной поставки). Умеет:
+                          console — логи и shell в терминале
+                          gui     — окно 480x320, мышь превращается в TOUCH
+                          term    — картинка прямо в терминал полублоками ANSI
+                          --shot  — сохранить один кадр
+                          --shell — выполнить команду и выйти
+                        Работает и по serial, и по TCP. Содержит
+                        последовательность сброса BOOT0/NRST через линии
+                        CH340 — чтобы не тянуться к кнопкам на плате.
+                        Структуры payload'ов продублированы в struct.Struct;
+                        при изменении orca_link.h править здесь тоже.
+    __pycache__/        мусор, не нужен
+
+  tools/module_sdk/
+    template/main.c     скелет модуля: orca_app_main(api) крутится, пока
+                        !api->task->should_stop(), плюс orca_app_stop().
+    template/Makefile   сборка .orca: arm-none-eabi-gcc, -mcpu=cortex-m7,
+                        -mfpu=fpv5-d16, -mfloat-abi=hard, -ffunction-sections,
+                        линковка `ld -r` (relocatable). Флаг -mlong-calls и
+                        комментарий про него УСТАРЕЛИ (см. errors.txt ERR-002).
+    template/module.ld  скрипт для ld -r: как раскладывать секции модуля.
+    (нет README, нет examples/esp_link — хотя на них ссылаются
+     sdcard_root/modules/esp_link/README.md и docs)
+
+
+================================================================================
+  sdcard_root/  —  СОДЕРЖИМОЕ microSD ЧАСОВ
+================================================================================
+
+  sdcard_root/modules/esp_link/
+    module.json     манифест модуля: имя, версия, точка входа, размер стека,
+                    запрошенные разрешения.
+    README.md       описание примера "мост к внешнему ESP через UART".
+                    Ссылается на tools/module_sdk/examples/esp_link/main.c,
+                    которого НЕТ.
+
+  Самого файла .orca тут нет — модуль надо собрать SDK и положить рядом.
+
+
+================================================================================
+  docs/  —  ДОКУМЕНТАЦИЯ
+================================================================================
+
+  architecture.md     общая архитектура: слои, карта памяти, потоки данных,
+                      обоснование решений (~8.8 КБ)
+  TASKS.md            план по майлстоунам M0..M6 с галочками (~5.4 КБ).
+                      Часть галочек устарела — например, THM_CALL отмечен
+                      как нереализованный, хотя он уже есть в загрузчике.
+  module_api.md       описание orca_api_t для авторов модулей (~4.6 КБ)
+  getting_started.md  как собрать прошивку и первый модуль (~1.8 КБ)
+
+
+================================================================================
+  ГДЕ ЧТО ИСКАТЬ (шпаргалка)
+================================================================================
+
+  протокол OLP                 firmware/OrcaKernel/link/orca_link.h
+  карта памяти                 firmware/OrcaKernel/hal/orca_memmap.h
+  что может модуль             firmware/OrcaKernel/api/orca_api.h
+  загрузка .orca               firmware/OrcaKernel/loader/orca_loader.c
+  порядок старта прошивки      firmware/Core/Src/main.c
+  тактирование и MPU           firmware/Core/Src/board.c
+  веб-морда моста              esp32/main/orca_web.c + esp32/main/web/
+  разбор OLP на телефоне       app/.../link/OlpParser.kt
+  где живёт соединение         app/.../service/OrcaLinkService.kt
+  быстро посмотреть экран с PC python3 tools/fbstream/orca_view.py --gui
